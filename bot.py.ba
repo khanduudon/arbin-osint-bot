@@ -1,0 +1,904 @@
+# bot.py — OSINT Suite v4 (Premium Emoji + Avatars + Maps)
+# runtime: python 3.10+
+# pip install aiogram==2.25.2 pydantic==1.10.13 aiohttp dnspython phonenumbers Pillow
+
+import asyncio
+import csv
+import io
+import re
+import sqlite3
+import time
+import uuid
+import phonenumbers
+import dns.resolver
+import aiohttp
+from PIL import Image
+from PIL.ExifTags import TAGS
+from contextlib import closing
+
+from aiogram import Bot, Dispatcher, types, executor
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.dispatcher.middlewares import BaseMiddleware
+from aiogram.dispatcher.handler import SkipHandler
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════
+BOT_TOKEN = "9105878132:AAHSRIV9W0UC8J-L5KVNNT93hXg-Flt8624"
+SUPER_ADMIN_ID = 7821806938
+DB_PATH = "osint_master.db"
+
+HIBP_API_KEY = ""
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{2,32}$")
+EMAIL_RE = re.compile(r"^[\w\.-]+@[\w\.-]+\.\w+$")
+DOMAIN_RE = re.compile(r"^(?!\-)(?:[a-zA-Z\d\-]{0,62}[a-zA-Z\d]\.){1,126}(?!\d+)[a-zA-Z\d]{1,63}$")
+BTC_RE = re.compile(r"^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}$")
+IP_RE = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
+
+SCAN_CACHE = {}
+LAST_SCAN_TIME = {}
+
+# ═══════════════════════════════════════════════════════════════════════
+# PREMIUM EMOJI (IDs from emoji-catalog.md)
+# ═══════════════════════════════════════════════════════════════════════
+def pe(eid: str, fallback: str) -> str:
+    return f'<tg-emoji emoji-id="{eid}">{fallback}</tg-emoji>'
+
+EMO_FIRE     = pe("5424972470023104089", "🔥")
+EMO_SEARCH   = pe("5874960879434338403", "🔍")
+EMO_CHECK    = pe("5206607081334906820", "✅")
+EMO_CROSS    = pe("5210952531676504517", "❌")
+EMO_CANCEL   = pe("5240241223632954241", "❌")
+EMO_BACK     = pe("5875082500023258804", "🔙")
+EMO_CROWN    = pe("5348306023889254367", "👑")
+EMO_STATS    = pe("5931472654660800739", "📊")
+EMO_LOCK     = pe("5296369303661067030", "🔒")
+EMO_WARN     = pe("5447644880824181073", "⚠️")
+EMO_INFO     = pe("5323442290708985472", "ℹ️")
+EMO_IDEA     = pe("5422439311196834318", "💡")
+EMO_PIN      = pe("5397782960512444700", "📌")
+EMO_BELL     = pe("5458603043203327669", "🔔")
+EMO_DOWNLOAD = pe("5386367538735104399", "📥")
+EMO_PROFILE  = pe("5879770735999717115", "👤")
+EMO_SUPPORT  = pe("5884510167986343350", "💬")
+EMO_EMAIL    = pe("5253742260054409879", "✉️")
+EMO_PHONE    = pe("5967591100532134862", "📱")
+EMO_GLOBE    = pe("5447410659077661506", "🌐")
+EMO_LOCATION = pe("5391032818111363540", "📍")
+EMO_DOLLAR   = pe("5409048419211682843", "💵")
+EMO_SHIELD   = pe("5361948635317680832", "🛡")
+EMO_IMAGE    = pe("5843506780931363129", "🖼")
+EMO_CAMERA   = pe("5348104929225489792", "📸")
+EMO_HISTORY  = pe("5877410604225924969", "🕒")
+EMO_PLUS     = pe("5397916757333654639", "➕")
+EMO_BAN      = pe("5872829476143894491", "🚫")
+EMO_ANNOUNCE = pe("5771695636411847302", "📢")
+EMO_WRENCH   = pe("5988023995125993550", "🛠")
+EMO_KEY      = pe("6005570495603282482", "🔑")
+EMO_AI       = pe("5931415565955503486", "🤖")
+EMO_CHART    = pe("5231200819986047254", "📈")
+EMO_STAR     = pe("5438496463044752972", "⭐")
+
+def sc(text: str) -> str:
+    return text.translate(str.maketrans(
+        "abcdefghijklmnopqrstuvwxyz",
+        "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘQʀꜱᴛᴜᴠᴡxʏᴢ"
+    ))
+
+# ═══════════════════════════════════════════════════════════════════════
+# DATABASE
+# ═══════════════════════════════════════════════════════════════════════
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
+        c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
+        c.execute("CREATE TABLE IF NOT EXISTS bans (user_id INTEGER PRIMARY KEY)")
+        c.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, target TEXT, type TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS custom_sites (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT, miss TEXT, hit TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (SUPER_ADMIN_ID,))
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance', '0')")
+        conn.commit()
+
+def get_setting(key, default="0"):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+def set_setting(key, value):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+
+def is_admin(uid: int) -> bool:
+    if uid == SUPER_ADMIN_ID: return True
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        return conn.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone() is not None
+
+def is_banned(uid: int) -> bool:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        return conn.execute("SELECT 1 FROM bans WHERE user_id=?", (uid,)).fetchone() is not None
+
+def log_user(uid: int):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+        conn.commit()
+
+def log_history(uid: int, target: str, type_: str):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT INTO history (user_id, target, type) VALUES (?, ?, ?)", (uid, target, type_))
+        conn.commit()
+
+def get_custom_sites():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        rows = conn.execute("SELECT name, url, miss, hit FROM custom_sites").fetchall()
+        return {r[0]: {"url": r[1], "miss": [r[2]] if r[2] else [], "hit": [r[3]] if r[3] else []} for r in rows}
+
+# ═══════════════════════════════════════════════════════════════════════
+# MIDDLEWARE
+# ═══════════════════════════════════════════════════════════════════════
+class SecurityMiddleware(BaseMiddleware):
+    async def on_pre_process_message(self, message: types.Message, data: dict):
+        uid = message.from_user.id if message.from_user else 0
+        if is_banned(uid): raise SkipHandler
+        if get_setting("maintenance") == "1" and not is_admin(uid):
+            await message.answer(f"{EMO_WRENCH} <b>Bot is currently under maintenance. Please try again later.</b>", parse_mode="HTML")
+            raise SkipHandler
+
+# ═══════════════════════════════════════════════════════════════════════
+# FSM
+# ═══════════════════════════════════════════════════════════════════════
+class BotStates(StatesGroup):
+    wait_username = State()
+    wait_email = State()
+    wait_phone = State()
+    wait_domain = State()
+    wait_ip = State()
+    wait_crypto = State()
+    wait_breach = State()
+    wait_image = State()
+    wait_exif = State()
+
+    admin_wait_id = State()
+    admin_wait_ban = State()
+    admin_wait_unban = State()
+    admin_wait_broadcast = State()
+    admin_wait_site = State()
+    admin_wait_lookup = State()
+
+# ═══════════════════════════════════════════════════════════════════════
+# OSINT ENGINE
+# ═══════════════════════════════════════════════════════════════════════
+BASE_SITES = {
+    "Reddit": {"url": "https://www.reddit.com/user/{u}/about.json", "api": "https://www.reddit.com/user/{u}/about.json"},
+    "Telegram": {"url": "https://t.me/{u}", "hit": ["tgme_page_title"]},
+    "Mastodon": {"url": "https://mastodon.social/@{u}"},
+    "Bluesky": {"url": "https://bsky.app/profile/{u}.bsky.social"},
+    "Instagram": {"url": "https://www.instagram.com/{u}/"},
+    "TikTok": {"url": "https://www.tiktok.com/@{u}"},
+    "GitHub": {"url": "https://github.com/{u}", "api": "https://api.github.com/users/{u}"},
+    "GitLab": {"url": "https://gitlab.com/{u}"},
+    "HackerNews": {"url": "https://news.ycombinator.com/user?id={u}", "miss": ["no such user."]},
+    "Steam": {"url": "https://steamcommunity.com/id/{u}", "miss": ["the specified profile could not be found"]},
+    "YouTube": {"url": "https://www.youtube.com/@{u}"},
+}
+
+def generate_variants(name: str) -> list[str]:
+    base = name.strip()
+    low = base.lower()
+    out = [base]
+    seen = {base}
+    def add(v):
+        if v and v not in seen and USERNAME_RE.match(v):
+            seen.add(v); out.append(v)
+    leet = low.replace("a", "4").replace("e", "3").replace("i", "1").replace("o", "0")
+    add(leet)
+    for suffix in ("1", "01", "99", "0", "7", "_"):
+        add(f"{low}{suffix}")
+    return out[:10]
+
+async def check_site(session, name, spec, username):
+    url = spec["url"].format(u=username)
+    try:
+        async with session.get(url, timeout=8) as r:
+            if r.status in (404, 410): return None
+            if not (200 <= r.status < 300): return None
+            text = (await r.content.read(128*1024)).decode("utf-8", "ignore").lower()
+
+            if spec.get("miss") and any(m in text for m in spec["miss"]): return None
+            if spec.get("hit") and not any(h in text for h in spec["hit"]): return None
+
+            enrich = ""
+            img = None
+            if "api" in spec:
+                try:
+                    async with session.get(spec["api"].format(u=username), timeout=5) as ar:
+                        if ar.status == 200:
+                            data = await ar.json()
+                            if name == "GitHub":
+                                enrich = f"({data.get('name','')} | {data.get('followers',0)} foll)"
+                                img = data.get("avatar_url")
+                            elif name == "Reddit":
+                                d = data.get("data", {})
+                                enrich = f"({d.get('total_karma',0)} karma)"
+                                icon = d.get("icon_img") or ""
+                                img = icon.split("?")[0] if icon else None
+                except Exception:
+                    pass
+            return {"site": name, "url": url, "username": username, "enrich": enrich, "img": img}
+    except Exception:
+        return None
+
+async def run_username_scan(target: str) -> list[dict]:
+    variants = generate_variants(target)
+    sites = {**BASE_SITES, **get_custom_sites()}
+    headers = {"User-Agent": UA}
+    sem = asyncio.Semaphore(30)
+    async def worker(session, v, n, s):
+        async with sem:
+            return await check_site(session, n, s, v)
+    async with aiohttp.ClientSession(headers=headers) as session:
+        tasks = [worker(session, v, n, s) for v in variants for n, s in sites.items()]
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r]
+
+# ═══════════════════════════════════════════════════════════════════════
+# KEYBOARDS (plain emoji — tg-emoji not supported in buttons)
+# ═══════════════════════════════════════════════════════════════════════
+def get_main_menu(uid: int):
+    m = InlineKeyboardMarkup(row_width=2)
+    m.add(
+        InlineKeyboardButton(text="🔍 ᴜꜱᴇʀɴᴀᴍᴇ ꜱᴄᴀɴ", callback_data="tool:username"),
+        InlineKeyboardButton(text="✉️ ᴇᴍᴀɪʟ ᴏꜱɪɴᴛ", callback_data="tool:email")
+    )
+    m.add(
+        InlineKeyboardButton(text="📱 ᴘʜᴏɴᴇ ᴏꜱɪɴᴛ", callback_data="tool:phone"),
+        InlineKeyboardButton(text="🌐 ᴅᴏᴍᴀɪɴ ʀᴇᴄᴏɴ", callback_data="tool:domain")
+    )
+    m.add(
+        InlineKeyboardButton(text="📍 ɪᴘ ʀᴇᴄᴏɴ", callback_data="tool:ip"),
+        InlineKeyboardButton(text="💵 ᴄʀʏᴘᴛᴏ ᴄʜᴇᴄᴋ", callback_data="tool:crypto")
+    )
+    m.add(
+        InlineKeyboardButton(text="🛡 ʙʀᴇᴀᴄʜ ᴄʜᴇᴄᴋ", callback_data="tool:breach"),
+        InlineKeyboardButton(text="🖼 ɪᴍᴀɢᴇ ꜱᴇᴀʀᴄʜ", callback_data="tool:image")
+    )
+    m.add(
+        InlineKeyboardButton(text="📸 ᴇxɪꜰ ᴇxᴛʀᴀᴄᴛ", callback_data="tool:exif"),
+        InlineKeyboardButton(text="🕒 ʜɪꜱᴛᴏʀʏ", callback_data="tool:history")
+    )
+    m.add(
+        InlineKeyboardButton(text="👤 ᴘʀᴏꜰɪʟᴇ", callback_data="menu:profile"),
+        InlineKeyboardButton(text="💬 ꜱᴜᴘᴘᴏʀᴛ", callback_data="menu:help")
+    )
+    if is_admin(uid):
+        m.add(InlineKeyboardButton(text="👑 ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ", callback_data="admin:main"))
+    return m
+
+def get_cancel_menu():
+    m = InlineKeyboardMarkup()
+    m.add(InlineKeyboardButton(text="❌ ᴄᴀɴᴄᴇʟ", callback_data="menu:cancel"))
+    return m
+
+def get_admin_menu():
+    m = InlineKeyboardMarkup(row_width=2)
+    maint = "🟢 ᴍᴀɪɴᴛᴇɴᴀɴᴄᴇ ᴏꜰꜰ" if get_setting("maintenance") == "0" else "🔴 ᴍᴀɪɴᴛᴇɴᴀɴᴄᴇ ᴏɴ"
+    m.add(
+        InlineKeyboardButton(text="➕ ᴀᴅᴅ/ʀᴇᴠᴏᴋᴇ ᴀᴅᴍɪɴ", callback_data="admin:toggle_admin"),
+        InlineKeyboardButton(text="🚫 ʙᴀɴ ᴜꜱᴇʀ", callback_data="admin:ban")
+    )
+    m.add(
+        InlineKeyboardButton(text="✅ ᴜɴʙᴀɴ ᴜꜱᴇʀ", callback_data="admin:unban"),
+        InlineKeyboardButton(text="🔍 ᴜꜱᴇʀ ʟᴏᴏᴋᴜᴘ", callback_data="admin:lookup")
+    )
+    m.add(
+        InlineKeyboardButton(text="📢 ʙʀᴏᴀᴅᴄᴀꜱᴛ", callback_data="admin:broadcast"),
+        InlineKeyboardButton(text=maint, callback_data="admin:maint")
+    )
+    m.add(
+        InlineKeyboardButton(text="🌐 ᴀᴅᴅ ꜱɪᴛᴇ", callback_data="admin:addsite"),
+        InlineKeyboardButton(text="📊 ꜱᴛᴀᴛꜱ", callback_data="admin:stats")
+    )
+    m.add(InlineKeyboardButton(text="🔙 ʙᴀᴄᴋ", callback_data="menu:main"))
+    return m
+
+def get_results_menu(scan_id: str, page: int, total_pages: int):
+    m = InlineKeyboardMarkup(row_width=2)
+    row = []
+    if page > 0: row.append(InlineKeyboardButton(text="◀️ ᴘʀᴇᴠ", callback_data=f"page:{scan_id}:{page-1}"))
+    if page < total_pages - 1: row.append(InlineKeyboardButton(text="ɴᴇxᴛ ▶️", callback_data=f"page:{scan_id}:{page+1}"))
+    if row: m.add(*row)
+    m.add(InlineKeyboardButton(text="📥 ᴇxᴘᴏʀᴛ ᴄꜱᴠ", callback_data=f"exp:{scan_id}"))
+    m.add(InlineKeyboardButton(text="🔙 ʙᴀᴄᴋ", callback_data="menu:main"))
+    return m
+
+# ═══════════════════════════════════════════════════════════════════════
+# HANDLERS
+# ═══════════════════════════════════════════════════════════════════════
+async def show_page(msg: types.Message, scan_id: str, page: int):
+    hits = SCAN_CACHE.get(scan_id, [])
+    start = page * 10
+    chunk = hits[start:start+10]
+    text = f"{EMO_CHECK} <b>Results</b> (Page {page+1}/{(len(hits)+9)//10})\n\n"
+    for h in chunk:
+        text += f"• <b>{h['site']}</b>: {h['url']} {h.get('enrich','')}\n"
+    await msg.edit_text(
+        text,
+        reply_markup=get_results_menu(scan_id, page, (len(hits)+9)//10),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+def register_handlers(dp: Dispatcher):
+
+    # ─── CANCEL ─────────────────────────────────────────────────────────
+    @dp.message_handler(commands=['cancel'], state='*')
+    async def cmd_cancel(message: types.Message, state: FSMContext):
+        await state.finish()
+        await message.reply(f"{EMO_CANCEL} <b>Cancelled.</b>", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    @dp.callback_query_handler(lambda c: c.data == "menu:cancel", state='*')
+    async def cb_cancel(call: types.CallbackQuery, state: FSMContext):
+        await state.finish()
+        await call.message.edit_text(f"👇 <b>{sc('Select A Module Below')}</b>", reply_markup=get_main_menu(call.from_user.id), parse_mode="HTML")
+
+    # ─── START ──────────────────────────────────────────────────────────
+    @dp.message_handler(commands=['start'])
+    async def cmd_start(message: types.Message, state: FSMContext):
+        await state.finish()
+        log_user(message.from_user.id)
+        name = message.from_user.first_name or "User"
+        text = (
+            f"{EMO_FIRE} <b>{sc('OSINT Master')}</b> {EMO_FIRE}\n\n"
+            f"➡️ <b>{sc('Welcome')}, {name}! ❤️</b>\n\n"
+            f"👇 <b>{sc('Select A Module Below')}</b>\n\n"
+            f"{EMO_IDEA} <i>Inline mode: type <code>@Arbib_osint_bot username</code> in any chat.</i>"
+        )
+        await message.answer(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    @dp.callback_query_handler(lambda c: c.data == "menu:main")
+    async def cb_menu_main(call: types.CallbackQuery, state: FSMContext):
+        await state.finish()
+        await call.message.edit_text(f"👇 <b>{sc('Select A Module Below')}</b>", reply_markup=get_main_menu(call.from_user.id), parse_mode="HTML")
+
+    # ─── TOOL ROUTING ───────────────────────────────────────────────────
+    @dp.callback_query_handler(lambda c: c.data.startswith("tool:"))
+    async def cb_tool(call: types.CallbackQuery, state: FSMContext):
+        tool = call.data.split(":")[1]
+
+        prompts = {
+            "username": f"{EMO_SEARCH} <b>Send the username to scan.</b>",
+            "email": f"{EMO_EMAIL} <b>Send the email address.</b>",
+            "phone": f"{EMO_PHONE} <b>Send the phone number with country code (e.g. +919876543210).</b>",
+            "domain": f"{EMO_GLOBE} <b>Send the domain (e.g. example.com).</b>",
+            "ip": f"{EMO_LOCATION} <b>Send the IP address.</b>",
+            "crypto": f"{EMO_DOLLAR} <b>Send the BTC wallet address.</b>",
+            "breach": f"{EMO_SHIELD} <b>Send the email to check for breaches.</b>",
+            "image": f"{EMO_IMAGE} <b>Send the image to reverse search.</b>",
+            "exif": f"{EMO_CAMERA} <b>Send the image as a FILE (not photo) to extract EXIF.</b>",
+            "history": f"{EMO_HISTORY} <b>Fetching history...</b>"
+        }
+
+        if tool == "history":
+            await call.message.edit_text(f"{EMO_HISTORY} Loading history...", reply_markup=get_cancel_menu(), parse_mode="HTML")
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                rows = conn.execute("SELECT target, type, timestamp FROM history WHERE user_id=? ORDER BY id DESC LIMIT 15", (call.from_user.id,)).fetchall()
+            if not rows:
+                await call.message.edit_text(f"{EMO_CROSS} No history found.", reply_markup=get_main_menu(call.from_user.id), parse_mode="HTML")
+                return
+            text = f"{EMO_HISTORY} <b>Recent Scans</b>\n\n"
+            for r in rows:
+                text += f"• <b>{r[1]}</b>: <code>{r[0]}</code> ({r[2][:10]})\n"
+            await call.message.edit_text(text, reply_markup=get_main_menu(call.from_user.id), parse_mode="HTML")
+            return
+
+        state_map = {
+            "username": BotStates.wait_username, "email": BotStates.wait_email,
+            "phone": BotStates.wait_phone, "domain": BotStates.wait_domain,
+            "ip": BotStates.wait_ip, "crypto": BotStates.wait_crypto,
+            "breach": BotStates.wait_breach, "image": BotStates.wait_image,
+            "exif": BotStates.wait_exif
+        }
+        await state_map[tool].set()
+        await call.message.edit_text(prompts[tool], reply_markup=get_cancel_menu(), parse_mode="HTML")
+
+    # ─── USERNAME ───────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_username)
+    async def proc_username(message: types.Message, state: FSMContext):
+        uid = message.from_user.id
+        now = time.time()
+        if now - LAST_SCAN_TIME.get(uid, 0) < 15:
+            wait = int(15 - (now - LAST_SCAN_TIME.get(uid, 0)))
+            return await message.reply(f"⏳ Cooldown active. Wait {wait}s.", reply_markup=get_cancel_menu())
+        LAST_SCAN_TIME[uid] = now
+
+        target = message.text.strip()
+        if not USERNAME_RE.match(target):
+            return await message.reply(f"{EMO_CROSS} Invalid format.", reply_markup=get_cancel_menu(), parse_mode="HTML")
+
+        log_history(uid, target, "username")
+
+        if uid != SUPER_ADMIN_ID:
+            try:
+                await message.bot.send_message(
+                    SUPER_ADMIN_ID,
+                    f"{EMO_BELL} <b>Live Log</b>\nUser <code>{uid}</code> scanned: <code>{target}</code>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        msg = await message.reply(f"{EMO_SEARCH} Scanning {target}...", parse_mode="HTML")
+        hits = await run_username_scan(target)
+
+        if not hits:
+            await state.finish()
+            return await msg.edit_text(f"{EMO_CROSS} No results for {target}.", reply_markup=get_main_menu(uid), parse_mode="HTML")
+
+        scan_id = str(uuid.uuid4())[:8]
+        SCAN_CACHE[scan_id] = hits
+        await state.finish()
+
+        # send first found avatar
+        for h in hits:
+            if h.get("img"):
+                try:
+                    await message.bot.send_photo(
+                        uid, photo=h["img"],
+                        caption=f"{EMO_CAMERA} Avatar found on <b>{h['site']}</b>",
+                        parse_mode="HTML"
+                    )
+                    break
+                except Exception:
+                    pass
+
+        await show_page(msg, scan_id, 0)
+
+    # ─── PHONE ──────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_phone)
+    async def proc_phone(message: types.Message, state: FSMContext):
+        raw = message.text.strip()
+        try:
+            p = phonenumbers.parse(raw, None)
+            if not phonenumbers.is_valid_number(p): raise ValueError
+            types_map = {0: "Fixed Line", 1: "Mobile", 2: "Fixed/Mobile", 3: "Toll Free", 4: "Premium Rate", 5: "Shared Cost", 6: "VoIP", 7: "Personal", 8: "Pager", 9: "UAN", 10: "Voicemail"}
+            region = phonenumbers.region_code_for_number(p)
+            carrier = phonenumbers.carrier.name_for_number(p, "en")
+            timezone = phonenumbers.timezone.time_zones_for_number(p)
+            text = (
+                f"{EMO_PHONE} <b>Phone OSINT</b>\n\n"
+                f"<b>Formatted:</b> {phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.INTERNATIONAL)}\n"
+                f"<b>Region:</b> {region}\n"
+                f"<b>Carrier:</b> {carrier or 'Unknown'}\n"
+                f"<b>Type:</b> {types_map.get(phonenumbers.number_type(p), 'Unknown')}\n"
+                f"<b>Timezone:</b> {', '.join(timezone) if timezone else 'Unknown'}"
+            )
+        except Exception:
+            text = f"{EMO_CROSS} Invalid phone number."
+        await state.finish()
+        await message.reply(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    # ─── IP ─────────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_ip)
+    async def proc_ip(message: types.Message, state: FSMContext):
+        ip = message.text.strip()
+        if not IP_RE.match(ip):
+            return await message.reply(f"{EMO_CROSS} Invalid IP.", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        await state.finish()
+        msg = await message.reply(f"{EMO_LOCATION} Looking up IP...", parse_mode="HTML")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://ip-api.com/json/{ip}?fields=status,message,country,regionName,city,zip,lat,lon,timezone,isp,org,as,query") as r:
+                    d = await r.json()
+                    if d["status"] != "success":
+                        return await msg.edit_text(f"{EMO_CROSS} Lookup failed.", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+                    text = (
+                        f"{EMO_LOCATION} <b>IP Recon: {ip}</b>\n\n"
+                        f"<b>Country:</b> {d.get('country')} ({d.get('regionName')})\n"
+                        f"<b>City:</b> {d.get('city')} ({d.get('zip')})\n"
+                        f"<b>Coords:</b> {d.get('lat')}, {d.get('lon')}\n"
+                        f"<b>ISP:</b> {d.get('isp')}\n"
+                        f"<b>Org:</b> {d.get('org')}\n"
+                        f"<b>ASN:</b> {d.get('as')}\n"
+                        f"<b>TZ:</b> {d.get('timezone')}"
+                    )
+                    lat, lon = d.get("lat"), d.get("lon")
+                    map_url = f"https://static-maps.yandex.ru/1.x/?ll={lon},{lat}&z=10&l=map&size=600,300"
+                    try:
+                        await message.bot.send_photo(message.chat.id, photo=map_url, caption=text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+                        await msg.delete()
+                        return
+                    except Exception:
+                        pass
+        except Exception:
+            text = f"{EMO_CROSS} Failed to connect to API."
+        await msg.edit_text(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    # ─── EXIF ───────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_exif, content_types=types.ContentType.DOCUMENT)
+    async def proc_exif(message: types.Message, state: FSMContext):
+        await state.finish()
+        msg = await message.reply(f"{EMO_CAMERA} Extracting EXIF...", parse_mode="HTML")
+        file = await message.bot.get_file(message.document.file_id)
+        buf = io.BytesIO()
+        await file.download(destination=buf)
+        try:
+            img = Image.open(buf)
+            exif = img._getexif()
+            if not exif:
+                return await msg.edit_text(f"{EMO_CROSS} No EXIF data found.", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+            text = f"{EMO_CAMERA} <b>EXIF Metadata</b>\n\n"
+            for tag_id, value in exif.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if tag in ["Make", "Model", "Software", "DateTime", "GPSInfo"]:
+                    text += f"• <b>{tag}:</b> <code>{value}</code>\n"
+        except Exception:
+            text = f"{EMO_CROSS} Failed to parse image."
+        await msg.edit_text(text[:4000], reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    # ─── DOMAIN ─────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_domain)
+    async def proc_domain(message: types.Message, state: FSMContext):
+        domain = message.text.strip()
+        if not DOMAIN_RE.match(domain):
+            return await message.reply(f"{EMO_CROSS} Invalid domain.", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        await state.finish()
+        msg = await message.reply(f"{EMO_GLOBE} Running DNS & WHOIS...", parse_mode="HTML")
+        text = f"{EMO_GLOBE} <b>Domain Recon: {domain}</b>\n\n"
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(f"https://dns.google/resolve?name={domain}&type=A") as r:
+                    data = await r.json()
+                    ips = [a["data"] for a in data.get("Answer", []) if a["type"] == 1]
+                    text += f"<b>IP Addresses:</b> {', '.join(ips) if ips else 'None'}\n"
+            except Exception:
+                pass
+            try:
+                async with session.get(f"https://api.hackertarget.com/whois/?q={domain}") as r:
+                    whois = await r.text()
+                    text += f"<b>WHOIS:</b>\n<code>{whois[:500]}</code>..."
+            except Exception:
+                pass
+        await msg.edit_text(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    # ─── CRYPTO ─────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_crypto)
+    async def proc_crypto(message: types.Message, state: FSMContext):
+        addr = message.text.strip()
+        if not BTC_RE.match(addr):
+            return await message.reply(f"{EMO_CROSS} Invalid BTC address.", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        await state.finish()
+        msg = await message.reply(f"{EMO_DOLLAR} Checking blockchain...", parse_mode="HTML")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://blockchain.info/rawaddr/{addr}?limit=0") as r:
+                    data = await r.json()
+                    bal = data.get("final_balance", 0) / 100000000
+                    txs = data.get("n_tx", 0)
+                    text = f"{EMO_DOLLAR} <b>Wallet</b>\n\n<code>{addr}</code>\nBalance: <b>{bal} BTC</b>\nTx: <b>{txs}</b>"
+        except Exception:
+            text = f"{EMO_CROSS} Failed."
+        await msg.edit_text(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    # ─── BREACH ─────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_breach)
+    async def proc_breach(message: types.Message, state: FSMContext):
+        email = message.text.strip()
+        if not EMAIL_RE.match(email):
+            return await message.reply(f"{EMO_CROSS} Invalid email.", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        await state.finish()
+        msg = await message.reply(f"{EMO_SHIELD} Checking breach databases...", parse_mode="HTML")
+        if not HIBP_API_KEY:
+            return await msg.edit_text(f"{EMO_SHIELD} <b>Breach Check</b>\n\n{EMO_WARN} API Key missing in config.", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {"hibp-api-key": HIBP_API_KEY, "user-agent": "OSINT-Bot"}
+                async with session.get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}", headers=headers) as r:
+                    if r.status == 404:
+                        text = f"{EMO_CHECK} Clean. No breaches found."
+                    elif r.status == 200:
+                        data = await r.json()
+                        text = f"{EMO_WARN} <b>Breaches ({len(data)})</b>\n\n" + "\n".join([f"• {b['Name']}" for b in data])
+                    else:
+                        text = f"{EMO_CROSS} API Error."
+        except Exception:
+            text = f"{EMO_CROSS} Failed."
+        await msg.edit_text(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    # ─── EMAIL ──────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_email)
+    async def proc_email(message: types.Message, state: FSMContext):
+        email = message.text.strip()
+        if not EMAIL_RE.match(email):
+            return await message.reply(f"{EMO_CROSS} Invalid email.", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        await state.finish()
+        msg = await message.reply(f"{EMO_EMAIL} Checking mail infrastructure...", parse_mode="HTML")
+        domain = email.split("@")[1]
+        try:
+            mx = dns.resolver.resolve(domain, 'MX')
+            text = f"{EMO_EMAIL} <b>Email Recon</b>\n\nDomain: <code>{domain}</code>\nMX: {', '.join([str(r.exchange) for r in mx])}\n\n{EMO_CHECK} Valid mail server."
+        except Exception:
+            text = f"{EMO_EMAIL} <b>Email Recon</b>\n\nDomain: <code>{domain}</code>\n{EMO_CROSS} No MX records."
+        await msg.edit_text(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
+
+    # ─── IMAGE ──────────────────────────────────────────────────────────
+    @dp.message_handler(state=BotStates.wait_image, content_types=types.ContentType.PHOTO)
+    async def proc_image(message: types.Message, state: FSMContext):
+        await state.finish()
+        msg = await message.reply(f"{EMO_IMAGE} Generating links...", parse_mode="HTML")
+        f = await message.bot.get_file(message.photo[-1].file_id)
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f.file_path}"
+        text = (
+            f"{EMO_IMAGE} <b>Reverse Image Search</b>\n\n"
+            f"• <a href='https://lens.google.com/uploadbyurl?url={file_url}'>Google Lens</a>\n"
+            f"• <a href='https://yandex.com/images/search?rpt=imageview&url={file_url}'>Yandex</a>\n"
+            f"• <a href='https://tineye.com/search?url={file_url}'>TinEye</a>"
+        )
+        await msg.edit_text(text, reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML", disable_web_page_preview=True)
+
+    # ─── PAGINATION / EXPORT ────────────────────────────────────────────
+    @dp.callback_query_handler(lambda c: c.data.startswith("page:"))
+    async def cb_page(call: types.CallbackQuery):
+        _, scan_id, page = call.data.split(":")
+        await show_page(call.message, scan_id, int(page))
+        await call.answer()
+
+    @dp.callback_query_handler(lambda c: c.data.startswith("exp:"))
+    async def cb_export(call: types.CallbackQuery):
+        scan_id = call.data.split(":")[1]
+        hits = SCAN_CACHE.get(scan_id, [])
+        if not hits:
+            return await call.answer("Expired.")
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Site", "URL", "Username", "Enrichment"])
+        for h in hits:
+            writer.writerow([h['site'], h['url'], h['username'], h.get('enrich', '')])
+        doc = InputFile(io.BytesIO(output.getvalue().encode('utf-8')), filename=f"results_{scan_id}.csv")
+        await call.message.answer_document(doc, caption="📥 Exported.")
+        await call.answer()
+
+    # ─── INLINE ─────────────────────────────────────────────────────────
+@dp.inline_handler()
+async def inline_scan(inline_query: types.InlineQuery):
+    target = inline_query.query.strip()
+    if not USERNAME_RE.match(target):
+        try:
+            await inline_query.answer([], cache_time=5)
+        except Exception:
+            pass
+        return 
+
+    # inline path is time-limited (~10s). use exact handle only, short timeouts.
+    sites = {**BASE_SITES, **get_custom_sites()}
+    headers = {"User-Agent": UA}
+    sem = asyncio.Semaphore(40)
+
+    async def _inline_check(session, name, spec, username):
+        async with sem:
+            url = spec["url"].format(u=username)
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=4)) as r:
+                    if r.status in (404, 410): return None
+                    if not (200 <= r.status < 300): return None
+                    text = (await r.content.read(64 * 1024)).decode("utf-8", "ignore").lower()
+                    if spec.get("miss") and any(m in text for m in spec["miss"]): return None
+                    if spec.get("hit") and not any(h in text for h in spec["hit"]): return None
+                    return {"site": name, "url": url}
+            except Exception:
+                return None
+
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            results_raw = await asyncio.gather(
+                *(_inline_check(session, n, s, target) for n, s in sites.items()),
+                return_exceptions=False
+            )
+    except Exception:
+        results_raw = []
+
+    hits = [r for r in results_raw if r]
+
+    results = []
+    for i, h in enumerate(hits[:10]):
+        results.append(
+            types.InlineQueryResultArticle(
+                id=f"{h['site']}_{i}",
+                title=h["site"],
+                description=h["url"],
+                input_message_content=types.InputTextMessageContent(
+                    message_text=f"<b>{h['site']}</b>: {h['url']}",
+                    parse_mode="HTML"
+                )
+            )
+        )
+
+    if not results:
+        results.append(
+            types.InlineQueryResultArticle(
+                id="fallback",
+                title=f"Scan @{target} in bot",
+                description="Tap to open the bot for a full deep scan",
+                input_message_content=types.InputTextMessageContent(
+                    message_text=f"@{target} — full scan in @Arbib_osint_bot",
+                    parse_mode="HTML"
+                )
+            )
+        )
+
+    try:
+        await inline_query.answer(results, cache_time=60, is_personal=True)
+    except Exception:
+        pass
+    # ─── ADMIN ──────────────────────────────────────────────────────────
+    @dp.callback_query_handler(lambda c: c.data.startswith("admin:"))
+    async def cb_admin(call: types.CallbackQuery, state: FSMContext):
+        if not is_admin(call.from_user.id):
+            return await call.answer("Access Denied", show_alert=True)
+        action = call.data.split(":")[1]
+
+        if action == "main":
+            await state.finish()
+            await call.message.edit_text(f"{EMO_CROWN} <b>Admin Panel</b>", reply_markup=get_admin_menu(), parse_mode="HTML")
+        elif action == "maint":
+            new_val = "1" if get_setting("maintenance") == "0" else "0"
+            set_setting("maintenance", new_val)
+            await call.message.edit_reply_markup(reply_markup=get_admin_menu())
+            await call.answer(f"Maintenance: {new_val}")
+        elif action == "stats":
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                scans = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+            await call.message.edit_text(f"{EMO_STATS} <b>Stats</b>\n\nUsers: {users}\nScans: {scans}", reply_markup=get_admin_menu(), parse_mode="HTML")
+        elif action == "toggle_admin":
+            await BotStates.admin_wait_id.set()
+            await call.message.edit_text(f"{EMO_CROWN} Send Telegram ID to add/revoke admin:", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        elif action == "ban":
+            await BotStates.admin_wait_ban.set()
+            await call.message.edit_text(f"{EMO_BAN} Send Telegram ID to ban:", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        elif action == "unban":
+            await BotStates.admin_wait_unban.set()
+            await call.message.edit_text(f"{EMO_CHECK} Send Telegram ID to unban:", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        elif action == "lookup":
+            await BotStates.admin_wait_lookup.set()
+            await call.message.edit_text(f"{EMO_SEARCH} Send Telegram ID to lookup:", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        elif action == "broadcast":
+            await BotStates.admin_wait_broadcast.set()
+            await call.message.edit_text(f"{EMO_ANNOUNCE} Send message:", reply_markup=get_cancel_menu(), parse_mode="HTML")
+        elif action == "addsite":
+            await BotStates.admin_wait_site.set()
+            await call.message.edit_text(f"{EMO_GLOBE} Format:\n<code>Name|https://site.com/{u}|miss|hit</code>", reply_markup=get_cancel_menu(), parse_mode="HTML")
+
+    @dp.message_handler(state=BotStates.admin_wait_id)
+    async def admin_toggle_admin(message: types.Message, state: FSMContext):
+        try:
+            uid = int(message.text.strip())
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                existing = conn.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone()
+                if existing:
+                    conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+                    msg = f"{EMO_CHECK} Admin revoked."
+                else:
+                    conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
+                    msg = f"{EMO_CHECK} Admin added."
+                conn.commit()
+            await message.reply(msg, reply_markup=get_admin_menu(), parse_mode="HTML")
+        except Exception:
+            await message.reply(f"{EMO_CROSS} Invalid ID.", reply_markup=get_admin_menu(), parse_mode="HTML")
+        await state.finish()
+
+    @dp.message_handler(state=BotStates.admin_wait_ban)
+    async def admin_ban(message: types.Message, state: FSMContext):
+        try:
+            uid = int(message.text.strip())
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.execute("INSERT OR IGNORE INTO bans (user_id) VALUES (?)", (uid,))
+                conn.commit()
+            await message.reply(f"{EMO_CHECK} Banned.", reply_markup=get_admin_menu(), parse_mode="HTML")
+        except Exception:
+            await message.reply(f"{EMO_CROSS} Invalid ID.", reply_markup=get_admin_menu(), parse_mode="HTML")
+        await state.finish()
+
+    @dp.message_handler(state=BotStates.admin_wait_unban)
+    async def admin_unban(message: types.Message, state: FSMContext):
+        try:
+            uid = int(message.text.strip())
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.execute("DELETE FROM bans WHERE user_id=?", (uid,))
+                conn.commit()
+            await message.reply(f"{EMO_CHECK} Unbanned.", reply_markup=get_admin_menu(), parse_mode="HTML")
+        except Exception:
+            await message.reply(f"{EMO_CROSS} Invalid ID.", reply_markup=get_admin_menu(), parse_mode="HTML")
+        await state.finish()
+
+    @dp.message_handler(state=BotStates.admin_wait_lookup)
+    async def admin_lookup(message: types.Message, state: FSMContext):
+        try:
+            uid = int(message.text.strip())
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                history = conn.execute("SELECT target, type FROM history WHERE user_id=? ORDER BY id DESC LIMIT 5", (uid,)).fetchall()
+                is_b = f"{EMO_BAN} Banned" if conn.execute("SELECT 1 FROM bans WHERE user_id=?", (uid,)).fetchone() else f"{EMO_CHECK} Clean"
+            text = f"{EMO_PROFILE} <b>User Lookup: {uid}</b>\n\nStatus: {is_b}\n\n<b>Recent Scans:</b>\n"
+            if history:
+                for h in history:
+                    text += f"• {h[1]}: <code>{h[0]}</code>\n"
+            else:
+                text += "No history."
+        except Exception:
+            text = f"{EMO_CROSS} Invalid ID."
+        await message.reply(text, reply_markup=get_admin_menu(), parse_mode="HTML")
+        await state.finish()
+
+    @dp.message_handler(state=BotStates.admin_wait_broadcast)
+    async def admin_broadcast(message: types.Message, state: FSMContext):
+        await state.finish()
+        users = [r[0] for r in sqlite3.connect(DB_PATH).execute("SELECT user_id FROM users").fetchall()]
+        msg = await message.reply(f"⏳ Broadcasting to {len(users)}...")
+        success = 0
+        for uid in users:
+            try:
+                await message.copy_to(uid)
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        await msg.edit_text(f"{EMO_CHECK} Sent {success}.", reply_markup=get_admin_menu(), parse_mode="HTML")
+
+    @dp.message_handler(state=BotStates.admin_wait_site)
+    async def admin_site(message: types.Message, state: FSMContext):
+        await state.finish()
+        parts = message.text.split("|")
+        if len(parts) != 4:
+            return await message.reply(f"{EMO_CROSS} Invalid format.", reply_markup=get_admin_menu(), parse_mode="HTML")
+        name, url, miss, hit = parts
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute("INSERT INTO custom_sites (name, url, miss, hit) VALUES (?, ?, ?, ?)", (name, url, miss, hit))
+            conn.commit()
+        await message.reply(f"{EMO_CHECK} Added {name}.", reply_markup=get_admin_menu(), parse_mode="HTML")
+
+    @dp.callback_query_handler(lambda c: c.data == "menu:help")
+    async def cb_help(call: types.CallbackQuery):
+        text = (
+            f"{EMO_WRENCH} <b>{sc('How To Use')}</b>\n\n"
+            f"• <b>Username</b> — 10 variants across 50+ sites\n"
+            f"• <b>Inline</b> — <code>@Arbib_osint_bot username</code> in any chat\n"
+            f"• <b>Phone</b> — carrier, region, line type\n"
+            f"• <b>IP</b> — geo + ISP + map\n"
+            f"• <b>EXIF</b> — send image as Document\n\n"
+            f"{EMO_INFO} <i>Use the Cancel button to abort any input.</i>"
+        )
+        await call.message.edit_text(text, reply_markup=get_main_menu(call.from_user.id), parse_mode="HTML")
+
+    @dp.callback_query_handler(lambda c: c.data == "menu:profile")
+    async def cb_profile(call: types.CallbackQuery):
+        role = f"{EMO_CROWN} Admin" if is_admin(call.from_user.id) else f"{EMO_PROFILE} User"
+        await call.message.edit_text(
+            f"{EMO_PROFILE} <b>Profile</b>\n\nID: <code>{call.from_user.id}</code>\nRole: {role}",
+            reply_markup=get_main_menu(call.from_user.id),
+            parse_mode="HTML"
+        )
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    init_db()
+    bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
+    dp = Dispatcher(bot, storage=MemoryStorage())
+    dp.middleware.setup(SecurityMiddleware())
+    register_handlers(dp)
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    print("Bot is starting...")
+    executor.start_polling(dp, skip_updates=True)
